@@ -116,6 +116,8 @@ MtpDrafter::~MtpDrafter() {
     for (auto& e : step_exec_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : round_exec_c_) if (e) cudaGraphExecDestroy(e);
     for (auto& e : step_exec_c_) if (e) cudaGraphExecDestroy(e);
+    for (auto& g : round_v_) for (auto& e : g) if (e) cudaGraphExecDestroy(e);
+    for (auto& g : step_v_) for (auto& e : g) if (e) cudaGraphExecDestroy(e);
     if (cparams_) cudaFree(cparams_);
     if (cring_) cudaFree(cring_);
     if (dinv_) cudaFree(dinv_);
@@ -125,7 +127,8 @@ MtpDrafter::~MtpDrafter() {
     if (cs_) cudaStreamDestroy(cs_);
     if (dense_) cudaFree(dense_);
     if (experts_) cudaFree(experts_);
-    if (state_arena_) cudaFree(state_arena_);
+    for (void* a : state_arenas_) if (a) cudaFree(a);
+    if (rsrc2_) cudaFree(rsrc2_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
     if (dhead_) cudaFree(dhead_);
@@ -148,7 +151,7 @@ const void* MtpDrafter::q8(const char* name) const {
 }
 
 bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-                      int64_t window) {
+                      int64_t window, int slots) {
     cudaGetDevice(&device_);   // a layer split's last stage on another GPU: the drafter lives there
     g_ = &g;
     ss_ = &ss;
@@ -156,6 +159,9 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     max_t_ = max_t;
     rt_dir_ = rt_dir;
     if (max_t < 1 || max_t > strata::kernels::kVerifyMaxT) { err = "mtp: max_t out of range"; return false; }
+    if (slots < 1) slots = 1;
+    if (slots > kMaxSlots) { err = "mtp: more states than the drafter supports"; return false; }
+    n_slots_ = slots;   // the solo state (st_) plus one per batch slot (st_extra_)
     // Loader fix (0.1.15+loaderfix.2): the two reads below are the whole “drafter files” cost; reporting
     // them apart from the rest of the stage is what makes the next regression visible.
     const auto t_files = std::chrono::steady_clock::now();
@@ -226,23 +232,59 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     qsa_set_kv_hybrid(false);
     if (kv_hybrid_was) qsa_set_kv_int8(true);   // the drafter under --kv k8v4: plain INT8
     uint64_t sb = qsa_state_bytes(g, max_cells, false, ring);
-    if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-    if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
-        if (st_.kv_mode == 0) { err = "mtp: state init failed"; return false; }
-        std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
-        cudaGetLastError();
-        cudaFree(state_arena_);
-        st_ = QsaState{};
-        ring = -1;   // fully resident
+    bool ring_fallback = false;
+    for (int s = 0; s < n_slots_; ++s) {
+        void* arena = nullptr;
+        if (cudaMalloc(&arena, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
+        QsaState st;
+        if (qsa_state_init(g, max_cells, arena, st, &ss.qsa_states[ss.qsa_primary()], ring) == 0) {
+            if (st.kv_mode == 0) { err = "mtp: state init failed"; return false; }
+            if (s == 0)
+                std::fprintf(stderr, "strata mtp: no pinned RAM left for the draft layer's K/V copy; keeping it in VRAM\n");
+            cudaGetLastError();
+            cudaFree(arena);
+            ring_fallback = true;
+            break;
+        }
+        state_arenas_.push_back(arena);
+        if (s == 0) st_ = st;
+        else st_extra_.push_back(st);
+    }
+    if (ring_fallback) {
+        ring = -1;   // fully resident, every slot
         sb = qsa_state_bytes(g, max_cells, false, ring);
-        if (cudaMalloc(&state_arena_, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
-        if (qsa_state_init(g, max_cells, state_arena_, st_, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
+        state_arenas_.clear();
+        st_extra_.clear();
+        st_ = QsaState{};
+        for (int s = 0; s < n_slots_; ++s) {
+            void* arena = nullptr;
+            if (cudaMalloc(&arena, sb) != cudaSuccess) { err = "mtp: the K/V state does not fit"; return false; }
+            QsaState st;
+            if (qsa_state_init(g, max_cells, arena, st, &ss.qsa_states[ss.qsa_primary()], ring) == 0) { err = "mtp: state init failed"; return false; }
+            state_arenas_.push_back(arena);
+            if (s == 0) st_ = st;
+            else st_extra_.push_back(st);
+        }
     }
     qsa_set_kv_int8(kv_int8_was);
     qsa_set_kv_hybrid(kv_hybrid_was);
-    qsa_state_zero(st_, g, nullptr);
+    for (int s = 0; s < n_slots_; ++s) {
+        if (s == 0) qsa_state_zero(st_, g, nullptr);
+        else qsa_state_zero(st_extra_[(size_t) (s - 1)], g, nullptr);
+    }
     cudaDeviceSynchronize();
-    vram_ += sb;
+    vram_ += sb * (uint64_t) n_slots_;
+    // --batch rounds read their window rows from here (the graphs bake the per-slot addresses)
+    if (n_slots_ > 1 &&
+        cudaMalloc((void**) &rsrc2_, (size_t) n_slots_ * (size_t) max_t_ * (size_t) (g.hc * g.n_embd) * sizeof(float)) != cudaSuccess) {
+        err = "mtp: the batch window staging does not fit";
+        return false;
+    }
+    if (rsrc2_) vram_ += (uint64_t) n_slots_ * (uint64_t) max_t_ * (uint64_t) (g.hc * g.n_embd) * sizeof(float);
+    for (int s = 0; s < kMaxSlots; ++s) {
+        round_v_[s].assign(9, nullptr);
+        step_v_[s].assign(9, nullptr);
+    }
 
     // ---- buffers
     window_ = (window > 0 && window < max_cells) ? window : 0;
@@ -689,7 +731,8 @@ bool MtpDrafter::capture_prefill_dev(int T, std::string& err) {
 }
 
 bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
-    cudaGraphExec_t& exec = coupled ? round_exec_c_[T] : round_exec_[T];
+    cudaGraphExec_t& exec = coupled ? round_exec_c_[T]
+                                    : (cur_slot_ < 0 ? round_exec_[T] : round_v_[cur_slot_][(size_t) T]);
     if (exec) return true;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
@@ -701,7 +744,10 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
     copy_i32_from_mapped(step_, m_step_, (int64_t) 2 * T * 4, cs_);
     copy_i32_from_mapped(pos_, m_pos_, (int64_t) 2 * T * g_->n_head, cs_);
     copy_i32_from_mapped(row_, m_row_, 2, cs_);
-    copy_from_mapped(Rin_, window_R_, (int64_t) T * HCN, cs_);
+    // --batch: a slot's rows are staged into its own block of rsrc2_ by draft_slot before this graph runs
+    const float* rsrc = cur_slot_ < 0 ? window_R_
+                                      : rsrc2_ + (size_t) cur_slot_ * (size_t) max_t_ * (size_t) HCN;
+    copy_from_mapped(Rin_, rsrc, (int64_t) T * HCN, cs_);
     // the catch-up: K/V for the window's T cells, then the full layer for row a only (its cell's K/V is written
     // again, identically), staged by the host in step row 2*max_t - 1; the draft chain is one graph per step
     // (`capture_step`) so the host can stop it when a draft is unlikely
@@ -723,7 +769,7 @@ bool MtpDrafter::capture_round(int T, bool coupled, std::string& err) {
 // Chain step j (1..max_t-2): one row at the cell staged in step row `max_t + j - 1`, from the previous step's
 // residual and token (left in Rin_[0] / tok_[0] by mtp_select); draft j and its probability to the mapped outputs.
 bool MtpDrafter::capture_step(int j, bool coupled, std::string& err) {
-    cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : step_exec_[j];
+    cudaGraphExec_t& exec = coupled ? step_exec_c_[j] : (cur_slot_ < 0 ? step_exec_[j] : step_v_[cur_slot_][(size_t) j]);
     if (exec) return true;
     using namespace strata::kernels;
     const int64_t HCN = g_->hc * g_->n_embd;
@@ -855,11 +901,15 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
                        float* probs, float min_p, int* n_drafts) {
     const OnDevice on_device(device_);
     if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
-    const bool cp = coupled_active_;   // coupled draft sampling for this request: its own graphs
+    const bool cp = coupled_active_ && cur_slot_ < 0;   // coupled draft sampling for this request: its own graphs
     if (!capture_round(T, cp, err)) return false;
     const int max_steps = std::min(max_t_ - 1, max_drafts_);
     for (int j = 1; j < max_steps; ++j)
         if (!capture_step(j, cp, err)) return false;
+    // the graphs of the active slot: solo's arrays, or a --batch slot's own (capture_round/step made them)
+    auto round_g = [&]() -> cudaGraphExec_t {
+        return cp ? round_exec_c_[T] : (cur_slot_ < 0 ? round_exec_[T] : round_v_[cur_slot_][(size_t) T]);
+    };
     const Clock::time_point t0 = Clock::now();
     const int64_t NH = g_->n_head;
     auto put = [&](int row, int64_t cell) {
@@ -895,12 +945,12 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
 
     int n = 0;
     if (min_p <= 0.0f && max_steps > 0) {
-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+        if (cudaGraphLaunch(round_g(), cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
         for (int j = 1; j < max_steps; ++j) {
-            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+            if (cudaGraphLaunch(cp ? step_exec_c_[j] : (cur_slot_ < 0 ? step_exec_[j] : step_v_[cur_slot_][(size_t) j]), cs_) != cudaSuccess) {
                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -929,7 +979,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         prefetch_ple(drafts[last]);
         n = max_steps;
     } else if (max_steps > 0) {
-        if (cudaGraphLaunch(cp ? round_exec_c_[T] : round_exec_[T], cs_) != cudaSuccess) {
+        if (cudaGraphLaunch(round_g(), cs_) != cudaSuccess) {
             err = std::string("mtp draft: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
@@ -950,7 +1000,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (probs) probs[0] = pj;
         n = 1;
         for (int j = 1; j < max_steps && pj >= min_p; ++j) {
-            if (cudaGraphLaunch(cp ? step_exec_c_[j] : step_exec_[j], cs_) != cudaSuccess) {
+            if (cudaGraphLaunch(cp ? step_exec_c_[j] : (cur_slot_ < 0 ? step_exec_[j] : step_v_[cur_slot_][(size_t) j]), cs_) != cudaSuccess) {
                 err = std::string("mtp draft step: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -973,6 +1023,45 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     ms_draft += ms_since(t0);
     ++rounds;
     return true;
+}
+
+void MtpDrafter::reset_slot(int slot) {
+    if (g_ == nullptr || slot < 0 || slot + 1 >= n_slots_) return;
+    const OnDevice on_device(device_);
+    qsa_state_zero(st_extra_[(size_t) slot], *g_, nullptr);
+    cudaDeviceSynchronize();
+}
+
+bool MtpDrafter::draft_slot(int slot, int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
+                            const float* rrows, float* probs, float min_p, int* n_drafts) {
+    const OnDevice on_device(device_);
+    if (slot < 0 || slot + 1 >= n_slots_) {
+        err = "mtp: draft_slot: the slot has no draft state (start with --batch and load slots = batch + 1)";
+        return false;
+    }
+    if (cur_slot_ >= 0) { err = "mtp: draft_slot is not reentrant"; return false; }
+    if (T < 1 || T > max_t_) { err = "mtp: draft_slot: T out of range"; return false; }
+    // the round graph reads this slot's window rows from its own block of rsrc2_ (the graphs bake the address;
+    // the block's rows move into place here, on the same stream the graph follows)
+    if (rrows != nullptr) {
+        const int64_t HCN = g_->hc * g_->n_embd;
+        float* dst = rsrc2_ + (size_t) slot * (size_t) max_t_ * (size_t) HCN;
+        if (cudaMemcpyAsync(dst, rrows, (size_t) T * (size_t) HCN * sizeof(float), cudaMemcpyDeviceToDevice, cs_) !=
+            cudaSuccess) {
+            err = std::string("mtp: draft_slot: staging the window rows failed");
+            return false;
+        }
+    }
+    // the batch slot's own K/V: swap it in for this round (the rounds serialize on the drafter's one stream and
+    // every draft() ends synced, so slot s+1's staging can follow s's launch)
+    cur_slot_ = slot;
+    QsaState saved = st_;
+    st_ = st_extra_[(size_t) slot];
+    const bool ok = draft(T, tokens, p, a, drafts, err, probs, min_p, n_drafts);
+    st_extra_[(size_t) slot] = st_;
+    st_ = saved;
+    cur_slot_ = -1;
+    return ok;
 }
 
 bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,

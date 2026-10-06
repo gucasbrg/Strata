@@ -41,9 +41,10 @@ public:
     MtpDrafter& operator=(const MtpDrafter&) = delete;
 
     /// Loads `rt_dir` (from tools/mtp_rt.py) and allocates the layer's K/V and buffers for up to `max_t` rows.
-    /// Call before the VRAM expert tier is sized: this takes ~0.9 GB.
+    /// Call before the VRAM expert tier is sized: this takes ~0.9 GB per state.  `slots` (> 1) is the total number
+    /// of states: the solo path's plus one per --batch slot (batch windows carry drafts); slot 0 is the solo path.
     bool load(const std::string& rt_dir, const ModelGeometry& g, SessionState& ss, int max_t, std::string& err,
-              int64_t window = 32768);
+              int64_t window = 32768, int slots = 1);
     /// The prompt's length: prefill() skips the cells the attention window can never reach again.
     void set_prompt_len(int64_t n) { prompt_len_ = n; }
     /// At most this many drafts per round (below max_t - 1): a window longer than the MTP's comes from elsewhere.
@@ -73,6 +74,20 @@ public:
     /// The first round: one cell (`cell`) from `R_row` (device) and `token` -> T-1 drafts.
     bool draft_first(int T, const float* R_row, int32_t token, int64_t cell, int32_t* drafts, std::string& err,
                      float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+
+    /// --batch: each slot's window is a fixed block of `rows_per_slot` rows of the batch window's final-residual
+    /// buffer (the MTP graphs read slot `s`'s rows from the drafter's own staging, filled by draft_slot's `rrows`).
+    void set_batch_layout(int rows_per_slot) { batch_rows_ = rows_per_slot; }
+    /// One round for --batch slot `slot` (0 <= slot < the `slots` of load() - 1; state 0 is the solo path's): like
+    /// draft(), but the catch-up reads `rrows` (device, T rows of hc*n_embd - the slot's block of the batch
+    /// window's final residuals; staged into this slot's buffer first) and the round runs on the batch slot's own
+    /// K/V state and graphs.  Coupled draft sampling is not available to batch slots (their requests' sampler
+    /// parameters are one per slot): drafts are argmax.  `drafts` gets T-1.
+    bool draft_slot(int slot, int T, const int32_t* tokens, int64_t p, int a, int32_t* drafts, std::string& err,
+                    const float* rrows = nullptr, float* probs = nullptr, float min_p = 0.0f, int* n_drafts = nullptr);
+    /// Zero a --batch slot's K/V state: call when a request enters the slot, so the draft layer never attends
+    /// cells of the conversation that had it before.  (Draft quality only refills as the windows write cells.)
+    void reset_slot(int slot);
 
     /// COUPLED DRAFT SAMPLING (core/coupled_draft.hpp; STRATA_SPEC_COUPLED=1, set up by bind()): the request's
     /// sampling.  A sampled request (temperature > 0, not greedy) then drafts by SAMPLING with the target's chain and
@@ -107,7 +122,17 @@ private:
     bool capture_prefill_dev(int T, std::string& err);   ///< E-4: without the mapped staging (inputs copied on device)
     bool capture_round(int T, bool coupled, std::string& err);
     bool capture_step(int j, bool coupled, std::string& err);
+    static constexpr int kMaxSlots = 8;
     cudaGraphExec_t step_exec_[9] = {};
+    // --batch: one K/V state and one pair of round/step graph tables per batch slot (cur_slot_ selects during
+    // capture and launch; -1 = the solo path).  st_ is the solo state (the conversation-cache convention's
+    // kv_state()); batch slot s swaps its state (st_extra_[s]) in and out around its calls.  Batch rounds read
+    // their window rows from rsrc2_ (kMaxSlots blocks of max_t_ rows): the slot's rows move there per round.
+    int n_slots_ = 1, cur_slot_ = -1, batch_rows_ = 0;
+    std::vector<QsaState> st_extra_;
+    std::vector<void*> state_arenas_;
+    float* rsrc2_ = nullptr;
+    std::vector<cudaGraphExec_t> round_v_[kMaxSlots], step_v_[kMaxSlots];
     // coupled draft sampling: its own round/step graphs (the argmax ones stay as they were), the request's
     // parameters and the penalty ring (mapped staging + device copies), the split scratch, token id -> subset index
     bool setup_coupled(std::string& err);
@@ -139,14 +164,12 @@ private:
     cudaGraphExec_t prefill_dev_exec_[9] = {};
     int32_t* pf_dev_ = nullptr;   ///< E-4: a prompt's rows' token / step / position records, uploaded at once
     int64_t pf_cap_ = 0;          ///< its capacity in ints
-    cudaGraphExec_t round_exec_[9] = {};
-
+    cudaGraphExec_t round_exec_[9] = {};   ///< slot 0's rounds (solo); --batch slots use round_v_
     struct Tensor { std::string name, kind; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
-    void* state_arena_ = nullptr;
-    QsaState st_;
+    QsaState st_;                 ///< the solo path's state (slot 0; kv_state()); batch slots swap through it
     void* arena_ = nullptr;
 
     // mapped staging: tokens, step records (2*max_t rows), positions per head (2*max_t rows), the selected row,

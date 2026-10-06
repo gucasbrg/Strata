@@ -3002,6 +3002,14 @@ int main(int argc, char** argv) {
     // Secure MTP's CUDA0 allocations before the large host arena is registered with both CUDA contexts.
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     strata::core::MtpDrafter mtp;
+    // FORK: --batch with MTP drafts in the windows (issue #857).  A slot's window carries K+1 rows (the fed token
+    // then K drafts); the accept is host-side (run_slot_rows + commit_slots, i.e. the non-pipelined batch path).
+    // Opt-in while this is new: STRATA_BATCH_MTP=1.  --batch-groups > 1 over a layer split keeps the old windows.
+    const bool batch_mtp = o.batch > 0 && o.batch <= 4 && o.spec >= 2 && !o.mtp.empty() &&
+                           !(o.batch_groups > 1 && !stages.empty()) && std::getenv("STRATA_BATCH_MTP") != nullptr;
+    if (std::getenv("STRATA_BATCH_MTP") != nullptr && o.batch > 0 && !batch_mtp && o.spec >= 2 && !o.mtp.empty())
+        std::fprintf(stderr, "strata generate: STRATA_BATCH_MTP is on but the batch windows keep no drafts "
+                             "(needs --batch 1..4, --spec >= 2, --mtp, and no --batch-groups over a layer split)\n");
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
@@ -3013,7 +3021,9 @@ int main(int argc, char** argv) {
         static const strata::core::ModelGeometry draft_geometry{};
         // with a layer split across GPUs the drafter reads the last stage's residual: it lives on that device
         const strata::core::OnDevice on_mtp(last_st ? last_st->dev : -1);
-        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+        if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st ? last_st->ss : ss, o.spec, err, o.mtp_window,
+                                        batch_mtp ? o.batch + 1 : 1)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
+        if (batch_mtp) mtp.set_max_drafts(1);   // one draft per slot per window (blocks of 2 rows, 4 slots = 8)
         mtp.set_ple_session(&ss);
     }
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
@@ -5883,6 +5893,10 @@ int main(int argc, char** argv) {
             int64_t p = 0;                 ///< its position
             int64_t produced = 0, max_new = 0;
             Clock::time_point t0;
+            // FORK (STRATA_BATCH_MTP): the draft the next window's second row feeds (valid from the slot's first
+            // MTP round on; an invalid one is padded with x, which only loses a row, never correctness)
+            int32_t draft = 0;
+            bool draft_valid = false;
             // the slot's own conversation cache: the tokens its sessions hold (the prompt, then every token a window
             // fed).  Kept when the request ends (`cached`), so the next turn of that conversation continues from it
             // instead of reading its history again (see `slot_source` in the request path).
@@ -5980,12 +5994,20 @@ int main(int argc, char** argv) {
             int rows[strata::kernels::kVerifyMaxT] = {};
             int32_t tok[strata::kernels::kVerifyMaxT] = {}, outb[strata::kernels::kVerifyMaxT] = {};
             int64_t pos[strata::kernels::kVerifyMaxT] = {};
-            for (int b = 0; b < (int) bs.size() && S < strata::kernels::kVerifyMaxT; ++b)
+            // STRATA_BATCH_MTP: a slot's block is [fed token, one draft] (two window rows), so 4 slots exactly
+            // fill kVerifyMaxT rows; wb/wbase/wa remember each block for the accept and the emit below
+            const int BMR = batch_mtp ? 2 : 1;
+            int wb[8] = {}, wbase[8] = {}, wa[8] = {}, nw = 0;
+            for (int b = 0; b < (int) bs.size() && S + BMR <= strata::kernels::kVerifyMaxT; ++b)
                 if (bs[(size_t) b].active) {
-                    rows[S] = b;
-                    tok[S] = bs[(size_t) b].x;
-                    pos[S] = bs[(size_t) b].p;
-                    ++S;
+                    BSlot& sl = bs[(size_t) b];
+                    if (batch_mtp) {
+                        wb[nw] = b; wbase[nw] = S; wa[nw] = 0; ++nw;
+                        rows[S] = b; tok[S] = sl.x; pos[S] = sl.p; ++S;
+                        rows[S] = b; tok[S] = sl.draft_valid ? sl.draft : sl.x; pos[S] = sl.p + 1; ++S;
+                    } else {
+                        rows[S] = b; tok[S] = sl.x; pos[S] = sl.p; ++S;
+                    }
                 }
             if (S == 0) return true;
             const bool was_busy = strata::core::progress().busy.load();
@@ -6005,6 +6027,19 @@ int main(int argc, char** argv) {
                 return false;
             }
             const Clock::time_point w1 = Clock::now();
+            // the host's accept (the solo window's rule, per block): draft row j+1 is kept when it equals the
+            // window's pick at row j; the commit record then carries each slot's kept prefix (set_batch_keep)
+            if (batch_mtp) {
+                for (int i = 0; i < nw; ++i) {
+                    int a = 0;
+                    while (a < 1 && tok[wbase[i] + a + 1] == outb[wbase[i] + a]) ++a;
+                    wa[i] = a;
+                    if (!ver.set_batch_keep(wb[i], a + 1, pos[wbase[i]], err)) {
+                        std::printf("ERR %s\n", err.c_str());
+                        return false;
+                    }
+                }
+            }
             if (!ver.commit_slots(err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return false;
@@ -6015,24 +6050,45 @@ int main(int argc, char** argv) {
             bt_commit += msd(w1, w2);
             ++bt_windows;
             bt_rows += S;
-            for (int t = 0; t < S; ++t) {
-                const int b = rows[t];
+            for (int t = 0; t < (batch_mtp ? nw : S); ++t) {
+                const int b = batch_mtp ? wb[t] : rows[t];
+                const int base = batch_mtp ? wbase[t] : t;
+                const int cnt = batch_mtp ? wa[t] + 1 : 1;   // committed rows of the slot's block (host's accept)
                 BSlot& sl = bs[(size_t) b];
-                const int32_t y = outb[t];
+                const int64_t p0 = sl.p;
+                const char* fin = nullptr;
+                bool done = false;
+                for (int j = 0; j < cnt; ++j) {
+                    const int32_t y = outb[base + j];
+                    std::printf("BT %d %d\n", b, (int) y);
+                    ++sl.produced;
+                    const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
+                    fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                                    : p0 + j + 2 > o.max_context ? "length" : nullptr;
+                    if (fin != nullptr) { done = true; break; }
+                }
                 sl.ids.push_back(sl.x);    // the window fed it: the slot's sessions hold it now
-                std::printf("BT %d %d\n", b, (int) y);
-                ++sl.produced;
-                const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
-                const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
-                                : sl.p + 2 > o.max_context ? "length" : nullptr;
-                if (fin != nullptr) {
+                for (int j = 0; j + 1 < cnt; ++j) sl.ids.push_back(tok[base + j + 1]);   // its accepted drafts
+                if (done) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                     std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
                     sl.active = false;
+                    sl.draft_valid = false;
                     sl.cached = o.prompt_cache > 0 && !sl.img;   // its sessions hold sl.ids for the next turn
                 } else {
-                    sl.x = y;
-                    sl.p += 1;
+                    sl.x = outb[base + cnt - 1];
+                    sl.p = p0 + cnt;
+                    sl.draft_valid = false;
+                    if (batch_mtp) {   // the next window's draft: the slot's own MTP round on its block's rows
+                        int32_t d0 = 0;
+                        const float* brow = ver.final_R_all() + (size_t) base * (size_t) (g.hc * g.n_embd);
+                        if (!mtp.draft_slot(b, cnt, outb + base, p0, cnt - 1, &d0, err, brow)) {
+                            std::printf("ERR %s\n", err.c_str());
+                            return false;
+                        }
+                        sl.draft = d0;
+                        sl.draft_valid = true;
+                    }
                 }
             }
             std::fflush(stdout);
@@ -7362,6 +7418,10 @@ int main(int argc, char** argv) {
                     ver.set_slot_sampling(admit_slot, req_sp);   // the request's own sampling, row by row
                     BSlot& sl = bs[(size_t) admit_slot];
                     sl = BSlot{};
+                    // STRATA_BATCH_MTP: the draft layer's state for this slot starts over, so it never attends
+                    // cells of whatever conversation had the slot before (draft quality only; the window decides
+                    // every committed token)
+                    if (batch_mtp) mtp.reset_slot(admit_slot);
                     sl.active = true;
                     sl.x = x;
                     sl.p = p;

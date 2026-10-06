@@ -140,17 +140,31 @@ public:
     //
     // Greedy only, no drafts (MTP) in a batch window.  `init_slots` once after `init` (S <= max_t); a layer
     // split's stages each get their own sessions, and run_slots/commit_slots continue into the next stage.
+    //
+    // DRAFTS: a row's slot may REPEAT across rows - with MTP drafts a slot's block of K+1 rows is the fed token
+    // then K drafts, at positions p..p+K.  The window's arithmetic over a block is the solo window's (the GDN
+    // conv and recurrence chain row to row inside the window, the K/V and indexer writes per row, attention
+    // masked by position); what differs is that the accept decision is the host's afterwards: `set_batch_keep`
+    // (per slot, from the host's own greedy compare) fixes what the commit makes permanent - the first n_keep
+    // (1..K+1) rows of the block - exactly as `commit(n_keep)` does for a solo window, so "a slot's greedy
+    // tokens are its solo greedy tokens" still holds.  Rows of a block past its kept prefix must read -1
+    // positions in the slot's commit record (stage_batch's default and set_batch_keep write it that way).
     bool init_slots(const std::vector<SessionState*>& slots, std::string& err);
     int n_slots() const { return (int) slots_.size(); }
     /// One batch window over slots [0, S): tokens[s] at positions pos[s]; out[s] = the greedy pick after it.
     bool run_slots(int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user, int32_t* out,
                    std::string& err);
-    /// The same over the S slots `rows` (row t is slot rows[t], any distinct slots in any order): the slots not
-    /// listed are not touched, so an idle slot keeps its state (a finished conversation it may continue later).
+    /// The same over the S slots `rows` (row t is slot rows[t]; any distinct slots in any order, or one slot
+    /// repeated - a block of drafts; the slots not listed are not touched, so an idle slot keeps its state).
     bool run_slot_rows(const int* rows, int S, const int32_t* tokens, const int64_t* pos, PoolMultiFn pool, void* user,
                        int32_t* out, std::string& err);
     /// Keep every row of the last batch window: each slot's state advances by its one token.
     bool commit_slots(std::string& err);
+    /// After a window whose rows carry drafts: what slot `slot`'s commit record keeps - `n_keep` rows (1..K+1)
+    /// starting at the block's first row (position `pos0`, rows at consecutive positions).  Writes the record and
+    /// the records of the later stages; between run_slot_rows and commit_slots.  Host-side accept: only for the
+    /// paths whose commit follows the window on the host's command (run_slot_rows / commit_slots).
+    bool set_batch_keep(int slot, int n_keep, int64_t pos0, std::string& err);
 
     // ---- The stages of a layer split as a PIPELINE.  A batch window over the slot GROUP
     // [base, base + S) is launched on ONE stage with its commit right behind it on the stage's stream (a batch window
@@ -240,6 +254,8 @@ private:
     float* tail_snap_b_ = nullptr;         ///< per (slot, QSA layer) indexer tail snapshot
     void* arena_b_ = nullptr;
     int64_t last_pos_b_[8] = {};
+    int keep_by_slot_[16] = {};            ///< set_batch_keep: per slot the kept rows of the last window (-1: none)
+    int keep_base_by_slot_[16] = {};       ///< ... and its block's first row index of the window
     bool capture_batch(const int* rows, int S, int hbase, std::string& err);
     void collect_profile();   ///< STRATA_VERIFY_PROFILE: add the last window's stamps to prof_sum_
     bool capture_commit_batch(const int* rows, int S, int hbase, std::string& err);

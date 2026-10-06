@@ -718,13 +718,18 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_quantize_q8_1(xm, xq_, (int) N, n, cs);
                 native_mmvq(wqkv->native_type, wqkv->native_data, xq_, qkv + (size_t) tb * C, (int) N, (int) C, n, cs);
                 stamp(l, 2, grp);
-                if (batch_rec_) {   // each row from its own slot's conv history, one row each
-                    for (int t = tb; t < te; ++t) {
+                if (batch_rec_) {   // one call per run of rows of the same slot: a row with a predecessor of its
+                    // own slot (an MTP block's later rows) chains off it inside the call, exactly as a solo
+                    // window's rows chain through one call
+                    for (int t = tb; t < te;) {
+                        int u = t + 1;
+                        while (u < te && brow_[u] == brow_[t]) ++u;
                         SessionState& sx = slot_ss(t);
                         const float* cx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats +
                                           (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
                         gdn_conv_l2_multi(cx, qkv + (size_t) t * C, (const float*) wc->data, hb + (size_t) t * C, (int) C,
-                                          (int) (2 * HK), EPS, 1, cs, 0);
+                                          (int) (2 * HK), EPS, u - t, cs, 0);
+                        t = u;
                     }
                 } else
                 gdn_conv_l2_multi(conv, qkv, (const float*) wc->data, hb, (int) C, (int) (2 * HK), EPS, n, cs, tb);
@@ -736,13 +741,16 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, cs);
                 stamp(l, 5, grp);
                 // the recurrence from the untouched state over tokens [0, te); outputs only for this group's
-                if (batch_rec_) {   // each row's recurrence from its own slot's state, one token
-                    for (int t = tb; t < te; ++t) {
+                if (batch_rec_) {   // one call per run of rows of the same slot (a block's later rows chain in it)
+                    for (int t = tb; t < te;) {
+                        int u = t + 1;
+                        while (u < te && brow_[u] == brow_[t]) ++u;
                         SessionState& sx = slot_ss(t);
                         float* stx = sx.gdn_state + (size_t) (gi - sx.gdn_ord0) * gdn_floats;
                         gdn_step_norm_multi(stx, hb + (size_t) t * C, (int) C, gate + (size_t) t * HV, beta + (size_t) t * HV,
                                             z_ + (size_t) t * ZV, (const float*) wnm->data, EPS, y_ + (size_t) t * ZV,
-                                            (int) HK, (int) HV, 1, nullptr, cs, 0);
+                                            (int) HK, (int) HV, u - t, nullptr, cs, 0);
+                        t = u;
                     }
                 } else
                 gdn_step_norm_multi(state, hb, (int) C, gate, beta, z_, (const float*) wnm->data, EPS, y_, (int) HK,
@@ -1837,6 +1845,9 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                 const WeightRef* wnm = need(v, "ssm_norm.weight", err);
                 if (!wnm) { ok = false; break; }
                 for (int t = 0; t < S; ++t) {
+                    if (t > 0 && rows[t] == rows[t - 1]) continue;   // an MTP block replays once, at its first row:
+                    // the record's n_keep rows are counted from here (gdn_conv_commit and the recurrence read the
+                    // stored inputs forward from this row's base pointer)
                     SessionState& sx = *slots_[(size_t) rows[t]];
                     const int32_t* keep = commitb_ + (size_t) rows[t] * CB;
                     float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
@@ -1856,16 +1867,23 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     const QsaState& st = slots_[(size_t) rows[t]]->qsa_states[qsa_index];
                     copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[t] * nQ + qsa_index) * TS, TS, cs_);
                     const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
-                    native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID, commitb_ + (size_t) rows[t] * CB + 2,
+                    // an MTP block's row j (< n_keep) re-appends at the record's j-th position; a row past the
+                    // kept prefix reads -1 and the append ignores it (the kernel returns on pos < 0)
+                    int base = t;
+                    while (base > 0 && rows[base - 1] == rows[t]) --base;
+                    native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + t) * ID,
+                                              commitb_ + (size_t) rows[t] * CB + 2 + (t - base),
                                               0, (const float*) wikn->data, EPS, ib, s, st.max_cells, rope_scaling(), cs_);
                 }
                 ++qsa_index;
             }
         }
         if (ok && ss_->ple.ready() && ple_stage())
-            for (int t = 0; t < S; ++t)
+            for (int t = 0; t < S; ++t) {
+                if (t > 0 && rows[t] == rows[t - 1]) continue;   // an MTP block: the record's keep[1] is its own
                 copy_indexed(slots_[(size_t) rows[t]]->ple_hist, hist_snap_ + (size_t) t * HS, HS,
                              commitb_ + (size_t) rows[t] * CB + 1, HS, cs_);
+            }
     } catch (const std::exception& e) {
         err = std::string("verify batch commit: ") + e.what();
         ok = false;
@@ -1893,9 +1911,10 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         return false;
     }
     for (int t = 0; t < S; ++t) {
-        bool dup = false;
-        for (int u = 0; u < t; ++u) dup = dup || rows[u] == rows[t];
-        if (rows[t] < 0 || rows[t] >= (int) slots_.size() || dup) { err = "verify: a batch row's slot is out of range or twice"; return false; }
+        // a slot may appear more than once (an MTP block: the fed token then its drafts); rows of one block are
+        // consecutive, which every per-block pass below relies on
+        if (rows[t] < 0 || rows[t] >= (int) slots_.size()) { err = "verify: a batch row's slot is out of range"; return false; }
+        keep_by_slot_[rows[t]] = -1;   // set_batch_keep turns this into the host's accept for drafted windows
     }
     if (released_.load()) { err = "verify: an earlier window never finished on the GPU (#267); restart the engine"; return false; }
     const ModelGeometry& g = *g_;
@@ -1921,6 +1940,10 @@ bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tok
         for (int t = 0; t < S; ++t) {
             const SessionState& sx = *slots_[(size_t) rows[t]];
             int32_t prev[2] = {sx.ple_prev[0], sx.ple_prev[1]};
+            if (t > 0 && rows[t] == rows[t - 1]) {   // a block's later rows: the window's own fed tokens precede them
+                prev[0] = t >= 2 && rows[t - 2] == rows[t] ? tokens[t - 2] : sx.ple_prev[1];
+                prev[1] = tokens[t - 1];
+            }
             ngram_rows(&tokens[t], prev, 1, ss_->ple.consts, ple_rows + t * PLE_N_HEADS);
         }
         if (!ss_->ple.table->gather_batch(ple_rows, (size_t) S, h_ple_, err)) return false;
@@ -2039,12 +2062,44 @@ bool Verifier::commit_slots(std::string& err) {
     if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
     if (ple_stage())
         for (int t = 0; t < S; ++t) {
-            SessionState& sx = *slots_[(size_t) last_rows_[t]];
-            sx.ple_prev[0] = sx.ple_prev[1];
-            sx.ple_prev[1] = last_tokens_[t];
+            const int slot = last_rows_[t];
+            if (t > 0 && last_rows_[t - 1] == slot) continue;   // a block commits once, at its first row
+            SessionState& sx = *slots_[(size_t) slot];
+            if (keep_by_slot_[slot] >= 0) {   // the host's accept: advance over the kept rows only
+                const int k = keep_by_slot_[slot], b = keep_base_by_slot_[slot];
+                sx.ple_prev[0] = k >= 2 ? last_tokens_[b + k - 2] : sx.ple_prev[1];
+                sx.ple_prev[1] = last_tokens_[b + k - 1];
+            } else {
+                sx.ple_prev[0] = sx.ple_prev[1];
+                sx.ple_prev[1] = last_tokens_[t];
+            }
         }
     ms_commit += ms_since(t0);
     return next_ == nullptr || next_->commit_slots(err);
+}
+
+bool Verifier::set_batch_keep(int slot, int n_keep, int64_t pos0, std::string& err) {
+    if (!last_batch_ || last_t_ < 1) { err = "verify: set_batch_keep without a batch window"; return false; }
+    if (slot < 0 || slot >= (int) slots_.size()) { err = "verify: set_batch_keep: slot out of range"; return false; }
+    int base = -1;
+    for (int t = 0; t < last_t_; ++t)
+        if (last_rows_[t] == slot && (t == 0 || last_rows_[t - 1] != slot)) { base = t; break; }
+    if (base < 0) { err = "verify: set_batch_keep: the slot has no row in the last window"; return false; }
+    int rows = 1;
+    while (base + rows < last_t_ && last_rows_[base + rows] == slot) ++rows;
+    if (n_keep < 1 || n_keep > rows || pos0 != last_pos_b_[base]) {
+        err = "verify: set_batch_keep: keep count or position out of range";
+        return false;
+    }
+    const int64_t CB = 2 + max_t_;
+    int32_t* c = h_commitb_ + (size_t) slot * CB;
+    c[0] = n_keep;
+    c[1] = n_keep - 1;
+    for (int64_t j = 0; j < CB - 2; ++j) c[2 + j] = j < n_keep ? (int32_t) (pos0 + j) : -1;
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    keep_by_slot_[slot] = n_keep;
+    keep_base_by_slot_[slot] = base;
+    return next_ == nullptr || next_->set_batch_keep(slot, n_keep, pos0, err);
 }
 
 bool Verifier::sample_rows(int S, std::string& err) {
