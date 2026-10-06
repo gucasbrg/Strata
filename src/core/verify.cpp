@@ -1906,13 +1906,18 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
 bool Verifier::stage_batch(const int* rows, int S, int hbase, const int32_t* tokens, const int64_t* pos,
                            std::string& err) {
     using namespace strata::kernels;
-    if (S < 1 || S > max_t_ || hbase < 0 || hbase + S > (int) slots_.size()) {
+    // a slot may appear more than once (an MTP block: the fed token then its drafts); rows of one block are
+    // consecutive, which every per-block pass below relies on.  Distinct-row windows (the slot groups of the
+    // pipeline) keep their hand-off rows within the slots; a block window's rows are its own and are bounded by
+    // the hand-off buffers' row capacity (kVerifyMaxT, the same max_t_ here).
+    const bool block_rows = S > (int) slots_.size();
+    if (S < 1 || S > max_t_ || hbase < 0 ||
+        (block_rows ? hbase + S > (int) std::max<int64_t>(max_t_, (int64_t) slots_.size())
+                    : hbase + S > (int) slots_.size())) {
         err = "verify: batch rows out of range (init_slots)";
         return false;
     }
     for (int t = 0; t < S; ++t) {
-        // a slot may appear more than once (an MTP block: the fed token then its drafts); rows of one block are
-        // consecutive, which every per-block pass below relies on
         if (rows[t] < 0 || rows[t] >= (int) slots_.size()) { err = "verify: a batch row's slot is out of range"; return false; }
         keep_by_slot_[rows[t]] = -1;   // set_batch_keep turns this into the host's accept for drafted windows
     }
