@@ -213,6 +213,9 @@ public:
     /// Plan v0.3 P6: split the window into two token groups and pipeline the CPU experts of one with the GPU work
     /// of the other (default on).  Set before the first `run`.
     void set_split(bool on) { split_ = on; }
+    /// A batch window's rows per slot (2 when the slots carry MTP drafts): the G=2 split of a batch window then
+    /// puts whole blocks in each group (--spec-split; a split inside a block would break its state chain).
+    void set_batch_blocks(int rows) { batch_blocks_ = rows > 0 ? rows : 1; }
     /// Plan v0.3 P6: how the PCIe share of the misses reaches the GPU: 0 = DMA into staging (the copy engine works
     /// beside the CPU; best when the CPU is compute-bound, the i-quants), 1 = the grouped kernel reads the mapped
     /// arena directly, 2 = a copy kernel stages it inside the graph (no API calls on the pool's thread; best when
@@ -345,6 +348,8 @@ private:
     void set_plan_slot(int grp);
     bool split_ = false;   // opt-in (--spec-split): exact but slower, see the overlap study
     int groups_[9] = {};
+    int last_g_ = 1;       ///< the last window's group count (run/run_slot_rows: what its seq steps rang in)
+    int batch_blocks_ = 1; ///< a batch window's rows per slot (an MTP block; the G=2 split stays block-aligned)
     float* h_ymiss_ = nullptr;   float* m_ymiss_ = nullptr;     // T * k * n_embd
 
     // device

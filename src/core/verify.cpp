@@ -558,13 +558,20 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const int64_t TS = (s.idx_block - 1) * ID;
     const bool ple_on = ss.ple.ready() && ple_stage();
     auto Rt = [&](int t) { return R_ + (size_t) t * HC * N; };
-    const int G = (split_ && T >= 2 && !batch_rec_) ? 2 : 1;   // a batch window is one group
+    // a batch window with MTP blocks splits at a block boundary (whole blocks per group - a split inside a block
+    // would sever its state chain); solo and one-row batch windows split at the middle as before
+    int g_half = (T + 1) / 2;
+    if (batch_rec_ && batch_blocks_ > 1) g_half = std::max(batch_blocks_, (g_half / batch_blocks_) * batch_blocks_);
+    const bool g_ok = split_ && T >= 2 &&
+                      (!batch_rec_ || (g_half >= batch_blocks_ && T - g_half >= batch_blocks_));
+    const int G = g_ok ? 2 : 1;   // a batch window used to be one group: its CPU experts then never overlapped
     static const bool dec_batch = [] { const char* v = std::getenv("STRATA_DEC_BATCH"); return v == nullptr || std::atoi(v) != 0; }();
     auto stamp = [&](int64_t l, int i, int grp) {
         if (prof_on_ && grp == 0) gpu_stamp(prof_, (int) (l * kProfPer + i), cs);
         if (trace_m_ != nullptr) gpu_stamp(trace_m_, (int) ((l * kProfPer + i) * 2 + grp), cs);   // #649
     };
-    const int tb_[2] = {0, (T + 1) / 2}, te_[2] = {G == 2 ? (T + 1) / 2 : T, T};
+    const int split_at = G == 2 ? g_half : T;
+    const int tb_[2] = {0, split_at}, te_[2] = {split_at, T};
     if (!batch_rec_) groups_[T] = G;
     const int64_t nQall = g.n_qsa_layers();
     // a batch window: row t is slot t, whose state lives in its own session
@@ -1434,6 +1441,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
     const int G = groups_[T] > 0 ? groups_[T] : 1;
+    last_g_ = G;
     const int gtb[2] = {0, (T + 1) / 2}, gte[2] = {G == 2 ? (T + 1) / 2 : T, T};
     const int64_t steps = (le_ - lb_) * G;
     const bool test_stall = g_test_stall > 0 && windows + 1 == g_test_stall;   // #267 test hook (off: false)
@@ -1601,7 +1609,7 @@ void Verifier::set_plan_slot(int grp) {
     sink_.ptr = (unsigned long long*) (base + ptr_off);
     sink_.ptr2 = sink_.ptr + cap;
     sink_.start2 = base + ptr_off + 4 * cap;
-    const int G = last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1);
+    const int G = last_g_ > 0 ? last_g_ : (last_batch_ ? 1 : (groups_[last_t_] > 0 ? groups_[last_t_] : 1));
     const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
     sink_.staging = (unsigned long long) (staging_ + (size_t) (grp * per) * strata::kernels::cpu::expert_layout().max_blob);
     sink_.staging_cap = per;
@@ -1994,9 +2002,19 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
     (void) cudaStreamQuery(cs_);
     volatile uint32_t* const seq = h_seq_;
     volatile uint32_t* const flag = h_flag_;
-    const int64_t steps = le_ - lb_;
+    // the same G the graph was captured with (record_window): --spec-split pipelines the CPU experts of one row
+    // group with the GPU work of the other; a batch window splits at a block boundary when slots carry drafts
+    int split_at = (S + 1) / 2;
+    if (batch_blocks_ > 1) split_at = std::max(batch_blocks_, (split_at / batch_blocks_) * batch_blocks_);
+    const bool g_ok = split_ && S >= 2 && (split_at >= batch_blocks_ && S - split_at >= batch_blocks_);
+    const int G = g_ok ? 2 : 1;
+    if (G == 1) split_at = S;
+    const int gtb[2] = {0, split_at}, gte[2] = {split_at, S};
+    last_g_ = G;
+    const int64_t steps = (le_ - lb_) * G;
     for (int64_t k = 0; k < steps; ++k) {
-        const int64_t l = lb_ + k;
+        const int64_t l = lb_ + k / G;
+        const int grp = (int) (k % G);
         const uint32_t want = (uint32_t) (k + 1);
         const Clock::time_point a = Clock::now();
         auto last_flush = a;
@@ -2022,9 +2040,12 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         }
         const Clock::time_point b = Clock::now();
         cur_layer_ = want - 1;
-        set_plan_slot(0);
+        set_plan_slot(grp);
+        const int tb = gtb[grp], n_grp = gte[grp] - gtb[grp];
         progress_at("verify batch: the CPU experts of layer", l);
-        if (pool != nullptr) pool(user, h_x_, h_ids_, S, ss_->k, h_ymiss_, l);
+        if (pool != nullptr)
+            pool(user, h_x_ + (size_t) tb * g.n_embd, h_ids_ + (size_t) tb * ss_->k, n_grp, ss_->k,
+                 h_ymiss_ + (size_t) tb * ss_->k * g.n_embd, l);
         progress_tick();
         std::atomic_thread_fence(std::memory_order_seq_cst);
         _mm_sfence();
@@ -2138,6 +2159,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
             sx.ple_prev[0] = sx.ple_prev[1];
             sx.ple_prev[1] = tokens[t];
         }
+    last_g_ = 1;   // a pipelined batch window is one group
     b_running_ = true;
     b_k_ = 0;
     b_steps_ = le_ - lb_;
