@@ -3477,8 +3477,7 @@ int main(int argc, char** argv) {
     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
     if (batch_mtp) {
         const char* why = o.batch < 2 ? "it needs --batch 2 or more" : o.mtp.empty() ? "it needs --mtp"
-                        : o.spec < 2 ? "it needs --spec T (T >= 2)" : (multi_gpu || split_same || !stages.empty())
-                        ? "it is for one GPU (no layer split or helper) for now" : !o.serve ? "it needs --serve" : nullptr;
+                        : o.spec < 2 ? "it needs --spec T (T >= 2)" : !o.serve ? "it needs --serve" : nullptr;
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: WARNING: --batch-mtp is off: %s\n", why);
             batch_mtp = false;
@@ -3582,13 +3581,13 @@ int main(int argc, char** argv) {
         if (batch_mtp) {
             for (int b = 0; b < o.batch; ++b) {
                 auto d = std::make_unique<strata::core::MtpDrafter>();
-                if (!d->load(o.mtp, draft_geometry, *bslot_ss[0][(size_t) b], o.spec, err, o.mtp_window, &mtp)) {
+                if (!d->load(o.mtp, draft_geometry, *bslot_ss[bslot_ss.size() - 1][(size_t) b], o.spec, err, o.mtp_window, &mtp)) {
                     std::fprintf(stderr, "strata generate: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
                     return 1;
                 }
                 d->set_max_drafts(1);   // the first candidate verifies one proposal per slot
-                d->set_ple_session(bslot_ss[0][(size_t) b].get());
+                d->set_ple_session(bslot_ss[bslot_ss.size() - 1][(size_t) b].get());
                 slot_mtp.push_back(std::move(d));
             }
         }
